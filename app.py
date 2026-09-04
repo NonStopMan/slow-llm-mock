@@ -121,8 +121,7 @@ class LatencyState:
 
 latency_state = LatencyState()
 
-MODEL_PROFILES = {"mock-fast", "mock-slow", "mock-hang"}
-
+MODEL_PROFILES = {"mock-fast", "mock-slow", "mock-normal", "mock-hang"}
 
 # ---------------------------------------------------------------------------
 # OpenAI-compatible chat completions endpoint
