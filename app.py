@@ -162,7 +162,13 @@ async def _apply_latency(model: str, override_ms: Optional[int]):
         await asyncio.sleep(HANG_SECONDS_DEFAULT)
         return
 
-    if model == "mock-slow":
+    # mock-normal is an alias of mock-slow's runtime-controlled latency, used
+    # when a separate mock deployment is dedicated to a "normal latency"
+    # lane (e.g. a concurrent dual-lane test comparing a slow-provider lane
+    # against a healthy one) - it reads the same /control/latency-range
+    # state as mock-slow, just under a different model name so cbllmgateway
+    # can route it via its own LD/subscription entry.
+    if model in ("mock-slow", "mock-normal"):
         secs = latency_state.delay_seconds()
         if secs is None:
             await asyncio.sleep(HANG_SECONDS_DEFAULT)
