@@ -67,6 +67,7 @@ import uuid
 from typing import Literal, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -122,6 +123,51 @@ class LatencyState:
 latency_state = LatencyState()
 
 MODEL_PROFILES = {"mock-fast", "mock-slow", "mock-normal", "mock-hang"}
+
+
+# ---------------------------------------------------------------------------
+# Runtime-controllable error injection (applies to every model, independent
+# of latency) - lets a test simulate a provider returning an error status
+# (e.g. 429 rate-limit, 503 unavailable) instead of a slow/hung response, to
+# exercise the same code paths a real provider outage would: adaptive
+# fallback's error-rate tracking, the concurrency guard's own error handling,
+# and openai_error_handler.py's status-code parsing.
+# ---------------------------------------------------------------------------
+class ErrorInjectionState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.mode: Literal["off", "always", "rate"] = "off"
+        self.status_code: int = 429
+        self.probability: float = 1.0  # used when mode == "rate"
+        self.error_type: str = "rate_limit_error"
+        self.message: str = "Mock injected provider error (rate limit)"
+
+    def snapshot(self):
+        with self.lock:
+            return {
+                "mode": self.mode,
+                "status_code": self.status_code,
+                "probability": self.probability,
+                "error_type": self.error_type,
+                "message": self.message,
+            }
+
+    def maybe_status_code(self) -> Optional[int]:
+        """Returns the status code to return instead of a real response, or
+        None to mean 'respond normally'."""
+        with self.lock:
+            mode, prob, code = self.mode, self.probability, self.status_code
+        if mode == "off":
+            return None
+        if mode == "always":
+            return code
+        if mode == "rate":
+            return code if random.random() < prob else None
+        return None
+
+
+error_state = ErrorInjectionState()
+
 
 # ---------------------------------------------------------------------------
 # OpenAI-compatible chat completions endpoint
@@ -206,6 +252,27 @@ async def chat_completions(
 
     await _apply_latency(req.model, req.delay_ms_override)
 
+    inject_status = error_state.maybe_status_code()
+    if inject_status is not None:
+        message, error_type = error_state.message, error_state.error_type
+        logger.info(
+            "model=%s injected_error_status=%d request_id=%s",
+            req.model,
+            inject_status,
+            request_id,
+        )
+        return JSONResponse(
+            status_code=inject_status,
+            content={
+                "error": {
+                    "message": message,
+                    "type": error_type,
+                    "param": None,
+                    "code": error_type,
+                }
+            },
+        )
+
     prompt = req.messages[-1].content if req.messages else ""
     text = _generate_text(prompt)
 
@@ -256,6 +323,7 @@ def control_status(x_control_token: Optional[str] = Header(default=None)):
     return {
         "mock_slow_latency": latency_state.snapshot(),
         "hang_seconds_default": HANG_SECONDS_DEFAULT,
+        "error_injection": error_state.snapshot(),
     }
 
 
@@ -294,6 +362,29 @@ def control_latency_range(
         latency_state.jitter_max_ms = int(update.max_seconds * 1000)
     logger.info("mock-slow latency range updated: %s", latency_state.snapshot())
     return {"ok": True, "mock_slow_latency": latency_state.snapshot()}
+
+
+class ErrorInjectionUpdate(BaseModel):
+    mode: Literal["off", "always", "rate"]
+    status_code: int = Field(429, ge=400, le=599)
+    probability: float = Field(1.0, ge=0.0, le=1.0)
+    error_type: str = "rate_limit_error"
+    message: str = "Mock injected provider error"
+
+
+@app.post("/control/error")
+def control_error(
+    update: ErrorInjectionUpdate, x_control_token: Optional[str] = Header(default=None)
+):
+    _require_control_token(x_control_token)
+    with error_state.lock:
+        error_state.mode = update.mode
+        error_state.status_code = update.status_code
+        error_state.probability = update.probability
+        error_state.error_type = update.error_type
+        error_state.message = update.message
+    logger.info("error injection updated: %s", error_state.snapshot())
+    return {"ok": True, "error_injection": error_state.snapshot()}
 
 
 @app.get("/healthz")
