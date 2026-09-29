@@ -54,20 +54,53 @@ reachable beyond a local Docker network (e.g. deployed for shared team use) -
 without it, anyone with the URL could invoke completions or induce latency
 that disrupts someone else's test run.
 
+Gemini (Google Vertex AI) support
+---------------------------------
+The same latency/error controls also drive a Vertex `generateContent` REST
+endpoint, so Gemini gateways (`ChatVertexAI` / `VertexAI` with
+api_transport="rest") can be pointed at this service by setting `api_endpoint`
+through the `llmgateway.additionalLlmConfig` LaunchDarkly flag. The model name
+is taken from the URL path (mock-fast / mock-slow / mock-normal / mock-hang).
+
+  - POST /v1beta1/projects/{p}/locations/{l}/publishers/google/models/{m}:generateContent
+    (also served under /v1/...). Errors use Google's error envelope.
+  - Auth: with service-account credentials the Google SDK does NOT call a token
+    endpoint; it sends a self-signed JWT (`iss` = the service account's
+    client_email) as the bearer. Once CONTROL_TOKEN is set, the Vertex endpoint
+    therefore requires either that JWT with `iss` == MOCK_GOOGLE_CLIENT_EMAIL, or
+    the access token issued by /token. The JWT signature is NOT verified - this is
+    a convenience filter against stray callers, not real authentication (the
+    endpoint only returns canned text; the /control/* endpoints stay protected by
+    CONTROL_TOKEN). Set MOCK_GOOGLE_CLIENT_EMAIL to the dummy service account's
+    client_email.
+  - POST /token: safety net standing in for Google's OAuth token endpoint. Set the
+    dummy service account's `token_uri` to it so that, if any code path ever does
+    an OAuth exchange, it hits this mock and never real Google.
+  - The Vertex endpoint polls for client disconnects while it holds a request, so
+    a test can confirm the gateway actually closed the socket at its timeout.
+    MOCK_DISCONNECT_POLL_SECONDS (default 1.0) sets the polling interval.
+  - Per-model request/response/disconnect counters: GET /control/status,
+    POST /control/stats/reset.
+
 This service is for QA use only. Do not point production traffic at it.
 """
 
 import asyncio
+import base64
+import hashlib
+import hmac
+import json
 import logging
 import os
 import random
 import threading
 import time
 import uuid
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
+from urllib.parse import parse_qs
 
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -77,6 +110,8 @@ app = FastAPI(title="mock-slow-llm", version="1.0.0")
 
 CONTROL_TOKEN = os.environ.get("CONTROL_TOKEN")  # unset => control endpoints disabled
 HANG_SECONDS_DEFAULT = float(os.environ.get("MOCK_HANG_SECONDS", "600"))  # 10 min
+DISCONNECT_POLL_SECONDS = float(os.environ.get("MOCK_DISCONNECT_POLL_SECONDS", "1.0"))
+MOCK_GOOGLE_CLIENT_EMAIL = os.environ.get("MOCK_GOOGLE_CLIENT_EMAIL")  # optional gate
 
 
 def _generate_text(prompt: str) -> str:
@@ -189,23 +224,15 @@ class ChatCompletionRequest(BaseModel):
     delay_ms_override: Optional[int] = None
 
 
-async def _apply_latency(model: str, override_ms: Optional[int]):
-    # Uses asyncio.sleep (not time.sleep) so a slow/hung request only "occupies"
-    # its own coroutine and does not block the event loop from serving other
-    # concurrent requests (e.g. the mock-fast canary lane) within this process.
-    # This keeps the mock service itself from becoming a confound in the test -
-    # any pileup you observe should come from cbllmgateway, not from this mock.
+def _resolve_delay_seconds(model: str, override_ms: Optional[int]) -> float:
     if override_ms is not None:
-        await asyncio.sleep(max(override_ms, 0) / 1000.0)
-        return
+        return max(override_ms, 0) / 1000.0
 
     if model == "mock-fast":
-        await asyncio.sleep(random.uniform(0.15, 0.3))
-        return
+        return random.uniform(0.15, 0.3)
 
     if model == "mock-hang":
-        await asyncio.sleep(HANG_SECONDS_DEFAULT)
-        return
+        return HANG_SECONDS_DEFAULT
 
     # mock-normal is an alias of mock-slow's runtime-controlled latency, used
     # when a separate mock deployment is dedicated to a "normal latency"
@@ -215,14 +242,19 @@ async def _apply_latency(model: str, override_ms: Optional[int]):
     # can route it via its own LD/subscription entry.
     if model in ("mock-slow", "mock-normal"):
         secs = latency_state.delay_seconds()
-        if secs is None:
-            await asyncio.sleep(HANG_SECONDS_DEFAULT)
-        else:
-            await asyncio.sleep(secs)
-        return
+        return HANG_SECONDS_DEFAULT if secs is None else secs
 
     # Unknown model name: behave like mock-fast rather than failing the test run.
-    await asyncio.sleep(random.uniform(0.15, 0.3))
+    return random.uniform(0.15, 0.3)
+
+
+async def _apply_latency(model: str, override_ms: Optional[int]):
+    # Uses asyncio.sleep (not time.sleep) so a slow/hung request only "occupies"
+    # its own coroutine and does not block the event loop from serving other
+    # concurrent requests (e.g. the mock-fast canary lane) within this process.
+    # This keeps the mock service itself from becoming a confound in the test -
+    # any pileup you observe should come from cbllmgateway, not from this mock.
+    await asyncio.sleep(_resolve_delay_seconds(model, override_ms))
 
 
 def _require_bearer_token(authorization: Optional[str]) -> None:
@@ -232,8 +264,10 @@ def _require_bearer_token(authorization: Optional[str]) -> None:
     if not CONTROL_TOKEN:
         return
     if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or malformed Authorization header.")
-    if authorization[len("Bearer "):] != CONTROL_TOKEN:
+        raise HTTPException(
+            status_code=401, detail="Missing or malformed Authorization header."
+        )
+    if authorization[len("Bearer ") :] != CONTROL_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid API key.")
 
 
@@ -277,7 +311,9 @@ async def chat_completions(
     text = _generate_text(prompt)
 
     elapsed_ms = int((time.monotonic() - started) * 1000)
-    logger.info("model=%s elapsed_ms=%d request_id=%s", req.model, elapsed_ms, request_id)
+    logger.info(
+        "model=%s elapsed_ms=%d request_id=%s", req.model, elapsed_ms, request_id
+    )
 
     return {
         "id": request_id,
@@ -301,6 +337,287 @@ async def chat_completions(
 
 
 # ---------------------------------------------------------------------------
+# Google Vertex AI (Gemini) endpoints
+# ---------------------------------------------------------------------------
+_GOOGLE_STATUS_BY_CODE = {
+    400: "INVALID_ARGUMENT",
+    401: "UNAUTHENTICATED",
+    403: "PERMISSION_DENIED",
+    404: "NOT_FOUND",
+    429: "RESOURCE_EXHAUSTED",
+    500: "INTERNAL",
+    503: "UNAVAILABLE",
+    504: "DEADLINE_EXCEEDED",
+}
+
+# Nginx-style "client closed request". The response is never delivered (the
+# client is already gone); the code only shows up in the mock's own logs/stats.
+_CLIENT_CLOSED_REQUEST = 499
+
+
+class VertexStats:
+    """Counters that let a test assert what the mock actually saw, e.g. how many
+    provider calls one gateway request turned into (SDK retries) and whether the
+    gateway closed the socket at its timeout (client disconnects)."""
+
+    _MAX_DISCONNECT_SAMPLES = 50
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self._clear()
+
+    def _clear(self):
+        self.received: dict[str, int] = {}
+        self.responses: dict[str, dict[str, int]] = {}
+        self.disconnects: dict[str, dict[str, Any]] = {}
+        self.in_flight = 0
+        self.peak_in_flight = 0
+        self.token_requests = 0
+        self.token_rejected = 0
+
+    def reset(self):
+        with self.lock:
+            self._clear()
+
+    def begin(self, model: str):
+        with self.lock:
+            self.received[model] = self.received.get(model, 0) + 1
+            self.in_flight += 1
+            self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
+
+    def end(self):
+        with self.lock:
+            self.in_flight -= 1
+
+    def record_response(self, model: str, status_code: int):
+        with self.lock:
+            by_status = self.responses.setdefault(model, {})
+            by_status[str(status_code)] = by_status.get(str(status_code), 0) + 1
+
+    def record_disconnect(self, model: str, elapsed_seconds: float):
+        with self.lock:
+            entry = self.disconnects.setdefault(
+                model, {"count": 0, "elapsed_seconds_last": []}
+            )
+            entry["count"] += 1
+            samples = entry["elapsed_seconds_last"]
+            samples.append(round(elapsed_seconds, 2))
+            del samples[: -self._MAX_DISCONNECT_SAMPLES]
+
+    def record_token_request(self, rejected: bool):
+        with self.lock:
+            self.token_requests += 1
+            if rejected:
+                self.token_rejected += 1
+
+    def snapshot(self):
+        with self.lock:
+            return {
+                "received_by_model": dict(self.received),
+                "responses_by_model_and_status": {
+                    m: dict(s) for m, s in self.responses.items()
+                },
+                "client_disconnects_by_model": {
+                    m: {
+                        "count": d["count"],
+                        "elapsed_seconds_last": list(d["elapsed_seconds_last"]),
+                    }
+                    for m, d in self.disconnects.items()
+                },
+                "in_flight": self.in_flight,
+                "peak_in_flight": self.peak_in_flight,
+                "token_requests": self.token_requests,
+                "token_rejected": self.token_rejected,
+            }
+
+
+vertex_stats = VertexStats()
+
+
+
+def _google_error_response(status_code: int, message: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {
+                "code": status_code,
+                "message": message,
+                "status": _GOOGLE_STATUS_BY_CODE.get(status_code, "UNKNOWN"),
+            }
+        },
+    )
+
+
+def _mock_google_access_token() -> str:
+    # Derived from CONTROL_TOKEN rather than randomly generated so it is
+    # stateless (still valid after a mock restart) and never exposes the control
+    # token itself.
+    digest = hmac.new(
+        (CONTROL_TOKEN or "").encode(), b"mock-google-access-token", hashlib.sha256
+    ).hexdigest()
+    return f"mock-{digest[:40]}"
+
+
+def _is_authorized_google_bearer(token: str) -> bool:
+    if hmac.compare_digest(token, _mock_google_access_token()):
+        return True
+    return bool(MOCK_GOOGLE_CLIENT_EMAIL) and (
+        _jwt_issuer(token) == MOCK_GOOGLE_CLIENT_EMAIL
+    )
+
+
+def _google_auth_error(authorization: Optional[str]) -> Optional[JSONResponse]:
+    # Same open-when-unconfigured rule as _require_bearer_token: no CONTROL_TOKEN
+    # means a purely local deployment, so leave the endpoint open.
+    if not CONTROL_TOKEN:
+        return None
+    if not authorization or not authorization.startswith("Bearer "):
+        return _google_error_response(
+            401, "Request had invalid authentication credentials."
+        )
+    if not _is_authorized_google_bearer(authorization[len("Bearer ") :]):
+        return _google_error_response(
+            401, "Request had invalid authentication credentials."
+        )
+    return None
+
+
+def _jwt_issuer(assertion: str) -> Optional[str]:
+    # Unverified decode of the JWT payload - only used to gate which
+    # service-account email is accepted, not as real authentication.
+    try:
+        payload_b64 = assertion.split(".")[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload_b64)).get("iss")
+    except Exception:
+        return None
+
+
+def _extract_vertex_prompt(body: dict) -> str:
+    contents = body.get("contents") or []
+    if not contents or not isinstance(contents[-1], dict):
+        return ""
+    parts = contents[-1].get("parts") or []
+    return " ".join(
+        p.get("text", "") for p in parts if isinstance(p, dict) and p.get("text")
+    )
+
+
+async def _wait_or_disconnect(request: Request, seconds: float) -> bool:
+    """Waits up to `seconds`. Returns True if the client disconnected first."""
+    deadline = time.monotonic() + seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        if await request.is_disconnected():
+            return True
+        await asyncio.sleep(min(DISCONNECT_POLL_SECONDS, remaining))
+
+
+@app.post(
+    "/v1beta1/projects/{project}/locations/{location}/publishers/google/models/{model}:generateContent"
+)
+@app.post(
+    "/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:generateContent"
+)
+async def vertex_generate_content(
+    project: str,
+    location: str,
+    model: str,
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+):
+    auth_error = _google_auth_error(authorization)
+    if auth_error is not None:
+        return auth_error
+
+    started = time.monotonic()
+    vertex_stats.begin(model)
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        if model not in MODEL_PROFILES:
+            logger.info("Unrecognized model '%s' - treating as mock-fast.", model)
+
+        disconnected = await _wait_or_disconnect(
+            request, _resolve_delay_seconds(model, None)
+        )
+        elapsed = time.monotonic() - started
+        if disconnected:
+            vertex_stats.record_disconnect(model, elapsed)
+            logger.info(
+                "vertex model=%s client_disconnected elapsed_s=%.2f", model, elapsed
+            )
+            return Response(status_code=_CLIENT_CLOSED_REQUEST)
+
+        inject_status = error_state.maybe_status_code()
+        if inject_status is not None:
+            vertex_stats.record_response(model, inject_status)
+            logger.info(
+                "vertex model=%s injected_error_status=%d elapsed_s=%.2f",
+                model,
+                inject_status,
+                elapsed,
+            )
+            return _google_error_response(inject_status, error_state.message)
+
+        prompt = _extract_vertex_prompt(body)
+        text = _generate_text(prompt)
+        vertex_stats.record_response(model, 200)
+        logger.info("vertex model=%s elapsed_s=%.2f", model, elapsed)
+        prompt_tokens = len(prompt.split())
+        completion_tokens = len(text.split())
+        return {
+            "candidates": [
+                {
+                    "content": {"role": "model", "parts": [{"text": text}]},
+                    "finishReason": "STOP",
+                    "index": 0,
+                }
+            ],
+            "usageMetadata": {
+                "promptTokenCount": prompt_tokens,
+                "candidatesTokenCount": completion_tokens,
+                "totalTokenCount": prompt_tokens + completion_tokens,
+            },
+            "modelVersion": model,
+        }
+    finally:
+        vertex_stats.end()
+
+
+@app.post("/token")
+async def google_oauth_token(request: Request):
+    # Stand-in for https://oauth2.googleapis.com/token, which the Google auth
+    # library calls (JWT-bearer grant, form-encoded) to exchange a service
+    # account's signed assertion for an access token.
+    form = parse_qs((await request.body()).decode("utf-8", "replace"))
+    assertion = (form.get("assertion") or [""])[0]
+
+    if MOCK_GOOGLE_CLIENT_EMAIL and _jwt_issuer(assertion) != MOCK_GOOGLE_CLIENT_EMAIL:
+        vertex_stats.record_token_request(rejected=True)
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_grant",
+                "error_description": "Unexpected JWT issuer.",
+            },
+        )
+
+    vertex_stats.record_token_request(rejected=False)
+    return {
+        "access_token": _mock_google_access_token(),
+        "expires_in": 3600,
+        "token_type": "Bearer",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Control plane
 # ---------------------------------------------------------------------------
 class LatencyUpdate(BaseModel):
@@ -312,9 +629,14 @@ class LatencyUpdate(BaseModel):
 
 def _require_control_token(x_control_token: Optional[str]):
     if not CONTROL_TOKEN:
-        raise HTTPException(status_code=503, detail="Control endpoint disabled: CONTROL_TOKEN not set on server.")
+        raise HTTPException(
+            status_code=503,
+            detail="Control endpoint disabled: CONTROL_TOKEN not set on server.",
+        )
     if not x_control_token or x_control_token != CONTROL_TOKEN:
-        raise HTTPException(status_code=401, detail="Invalid or missing X-Control-Token.")
+        raise HTTPException(
+            status_code=401, detail="Invalid or missing X-Control-Token."
+        )
 
 
 @app.get("/control/status")
@@ -324,11 +646,23 @@ def control_status(x_control_token: Optional[str] = Header(default=None)):
         "mock_slow_latency": latency_state.snapshot(),
         "hang_seconds_default": HANG_SECONDS_DEFAULT,
         "error_injection": error_state.snapshot(),
+        "vertex_stats": vertex_stats.snapshot(),
     }
 
 
+@app.post("/control/stats/reset")
+def control_stats_reset(x_control_token: Optional[str] = Header(default=None)):
+    _require_control_token(x_control_token)
+    vertex_stats.reset()
+    logger.info("vertex stats reset")
+    return {"ok": True, "vertex_stats": vertex_stats.snapshot()}
+
+
+
 @app.post("/control/latency")
-def control_latency(update: LatencyUpdate, x_control_token: Optional[str] = Header(default=None)):
+def control_latency(
+    update: LatencyUpdate, x_control_token: Optional[str] = Header(default=None)
+):
     _require_control_token(x_control_token)
     with latency_state.lock:
         latency_state.mode = update.mode
@@ -343,8 +677,12 @@ class LatencyRangeUpdate(BaseModel):
     # Seconds, not ms - readability for QA runs that dial in minute-scale delays
     # (e.g. reproducing the 3-4+ minute provider-slowness incident) without
     # doing ms arithmetic by hand. Thin wrapper over the existing jitter mode.
-    min_seconds: float = Field(..., ge=0, description="Lower bound of the random delay, in seconds")
-    max_seconds: float = Field(..., ge=0, description="Upper bound of the random delay, in seconds")
+    min_seconds: float = Field(
+        ..., ge=0, description="Lower bound of the random delay, in seconds"
+    )
+    max_seconds: float = Field(
+        ..., ge=0, description="Upper bound of the random delay, in seconds"
+    )
 
 
 @app.post("/control/latency-range")
